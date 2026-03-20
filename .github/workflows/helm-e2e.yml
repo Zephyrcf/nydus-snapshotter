@@ -202,292 +202,36 @@ jobs:
       - name: Stop snapshotter and verify nginx stays healthy
         run: |
           set -euo pipefail
-
-          WORKER_CONTAINER="${KIND_CLUSTER_NAME}-worker"
-
-          dump_snapshotter_stop_debug() {
-            local selector
-
-            selector="app.kubernetes.io/name=nydus-snapshotter,app.kubernetes.io/instance=${HELM_RELEASE}"
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" get ds nydus-snapshotter -n "${HELM_NAMESPACE}" -o wide >&2 || true
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" describe ds nydus-snapshotter -n "${HELM_NAMESPACE}" >&2 || true
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" get pods -n "${HELM_NAMESPACE}" -l "${selector}" -o wide >&2 || true
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" logs -n "${HELM_NAMESPACE}" -l app.kubernetes.io/name=nydus-snapshotter --all-containers >&2 || true
-            docker exec "${WORKER_CONTAINER}" sh -lc "ps -ef | grep containerd-nydus-grpc | grep -v grep || true" >&2 || true
-          }
-
-          wait_for_snapshotter_stopped() {
-            local selector
-            local pods=""
-            local active_pods=""
-            local running_processes=""
-
-            selector="app.kubernetes.io/name=nydus-snapshotter,app.kubernetes.io/instance=${HELM_RELEASE}"
-
-            if ! kubectl --context "kind-${KIND_CLUSTER_NAME}" wait --for=jsonpath='{.status.desiredNumberScheduled}'=0 ds/nydus-snapshotter -n "${HELM_NAMESPACE}" --timeout=120s; then
-              echo "Snapshotter DaemonSet desiredNumberScheduled did not reach 0" >&2
-              dump_snapshotter_stop_debug
-              return 1
-            fi
-
-            if ! kubectl --context "kind-${KIND_CLUSTER_NAME}" wait --for=jsonpath='{.status.currentNumberScheduled}'=0 ds/nydus-snapshotter -n "${HELM_NAMESPACE}" --timeout=120s; then
-              echo "Snapshotter DaemonSet currentNumberScheduled did not reach 0" >&2
-              dump_snapshotter_stop_debug
-              return 1
-            fi
-
-            if ! kubectl --context "kind-${KIND_CLUSTER_NAME}" wait --for=jsonpath='{.status.numberReady}'=0 ds/nydus-snapshotter -n "${HELM_NAMESPACE}" --timeout=120s; then
-              echo "Snapshotter DaemonSet numberReady did not reach 0" >&2
-              dump_snapshotter_stop_debug
-              return 1
-            fi
-
-            pods="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pods -n "${HELM_NAMESPACE}" -l "${selector}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
-            active_pods="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pods -n "${HELM_NAMESPACE}" -l "${selector}" --no-headers 2>/dev/null | awk '$3 != "Completed" && $3 != "Succeeded" && $3 != "Failed" && $3 != "Terminating" {count++} END {print count+0}')"
-            running_processes="$(docker exec "${WORKER_CONTAINER}" sh -lc "ps -ef | grep containerd-nydus-grpc | grep -v grep || true")"
-            echo "snapshotter drain status: desired=0 current=0 ready=0 pods=${pods:-0} active=${active_pods:-0}"
-
-            if [ "${active_pods:-0}" != "0" ]; then
-              echo "Snapshotter still has active pods after DaemonSet scaled down" >&2
-              dump_snapshotter_stop_debug
-              return 1
-            fi
-
-            if [ -n "${running_processes}" ]; then
-              echo "Snapshotter process is still running on the worker after DaemonSet scaled down" >&2
-              printf '%s\n' "${running_processes}" >&2
-              dump_snapshotter_stop_debug
-              return 1
-            fi
-          }
+          source tests/helpers/helm-e2e.sh
 
           kubectl --context "kind-${KIND_CLUSTER_NAME}" patch ds nydus-snapshotter -n "${HELM_NAMESPACE}" --type=json \
             -p='[{"op":"add","path":"/spec/template/spec/nodeSelector","value":{"nydus-test/disable":"true"}}]'
 
-          wait_for_snapshotter_stopped
+          helm_e2e::wait_for_snapshotter_stopped
 
-          active_pods="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pods -n "${HELM_NAMESPACE}" -l app.kubernetes.io/name=nydus-snapshotter --no-headers 2>/dev/null | awk '$3 != "Completed" && $3 != "Succeeded" && $3 != "Failed" && $3 != "Terminating" {count++} END {print count+0}')"
+          active_pods="$(helm_e2e::get_snapshotter_active_pod_count)"
           test "${active_pods}" = "0"
-          kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod -n "${WORKLOAD_NAMESPACE}" "${NGINX_POD_NAME}" -o jsonpath='{.status.phase}' | grep '^Running$'
-          docker exec "${WORKER_CONTAINER}" sh -lc "curl -fsS -o /dev/null -I http://127.0.0.1:${NGINX_HOST_PORT}"
+          helm_e2e::assert_workload_healthy 180s
 
       - name: Restore worker containerd baseline for snapshotter recovery
         run: |
           set -euo pipefail
-
-          WORKER_CONTAINER="${KIND_CLUSTER_NAME}-worker"
-
-          dump_worker_containerd_baseline_debug() {
-            docker exec "${WORKER_CONTAINER}" sh -lc '
-              echo "--- /etc/containerd/config.toml ---"
-              sed -n "1,240p" /etc/containerd/config.toml || true
-              echo "--- /etc/containerd/nydus-proxy.toml ---"
-              sed -n "1,240p" /etc/containerd/nydus-proxy.toml || true
-              echo "--- crictl info ---"
-              crictl info || true
-              echo "--- containerd config dump ---"
-              containerd config dump 2>/dev/null || true
-              echo "--- containerd journal ---"
-              journalctl -u containerd -n 120 --no-pager || true
-            ' >&2 || true
-          }
-
-          wait_for_worker_containerd_ready() {
-            local attempt=""
-
-            for attempt in $(seq 1 60); do
-              if docker exec "${WORKER_CONTAINER}" sh -lc 'ctr --address /run/containerd/containerd.sock version >/dev/null 2>&1'; then
-                return 0
-              fi
-              sleep 2
-            done
-
-            echo "worker containerd did not become ready after baseline restore" >&2
-            dump_worker_containerd_baseline_debug
-            return 1
-          }
-
-          restore_worker_containerd_baseline() {
-            local info_json=""
-            local config_toml=""
-            local default_runtime=""
-            local root_snapshotter=""
-            local import_count=""
-
-            echo "Restoring worker containerd baseline to runc/overlayfs" >&2
-            docker exec "${WORKER_CONTAINER}" sh -lc '
-              set -eu
-              config_path="/etc/containerd/config.toml"
-              import_path="/etc/containerd/nydus-proxy.toml"
-
-              if grep -qF "$import_path" "$config_path"; then
-                sed -i "\|$import_path|d" "$config_path"
-              fi
-
-              rm -f /run/containerd-nydus/.containerd-restart-required
-              systemctl restart containerd
-            '
-
-            wait_for_worker_containerd_ready
-
-            info_json="$(docker exec "${WORKER_CONTAINER}" sh -lc 'crictl info -o json')"
-            config_toml="$(docker exec "${WORKER_CONTAINER}" sh -lc 'cat /etc/containerd/config.toml')"
-            default_runtime="$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("config", {}).get("containerd", {}).get("defaultRuntimeName", ""))' <<<"${info_json}")"
-            root_snapshotter="$(printf '%s\n' "${config_toml}" | sed -n 's/^[[:space:]]*snapshotter[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
-            import_count="$(printf '%s\n' "${config_toml}" | grep -cF '/etc/containerd/nydus-proxy.toml' || true)"
-
-            echo "worker containerd baseline: defaultRuntimeName=${default_runtime:-<empty>} root.snapshotter=${root_snapshotter:-<empty>} nydusImportCount=${import_count:-<empty>}" >&2
-
-            if [ "${default_runtime}" != "runc" ] || [ "${root_snapshotter}" != "overlayfs" ] || [ "${import_count}" != "0" ]; then
-              echo "worker containerd did not restore to the expected runc/overlayfs baseline" >&2
-              dump_worker_containerd_baseline_debug
-              return 1
-            fi
-          }
-
-          restore_worker_containerd_baseline
-          kubectl --context "kind-${KIND_CLUSTER_NAME}" wait --for=condition=Ready -n "${WORKLOAD_NAMESPACE}" pod/"${NGINX_POD_NAME}" --timeout=180s
-          docker exec "${WORKER_CONTAINER}" sh -lc "curl -fsS -o /dev/null -I http://127.0.0.1:${NGINX_HOST_PORT}"
+          source tests/helpers/helm-e2e.sh
+          helm_e2e::restore_worker_containerd_baseline "snapshotter recovery"
+          helm_e2e::assert_workload_healthy 180s
 
       - name: Recover snapshotter and verify nginx stays healthy
         run: |
           set -euo pipefail
-
-          WORKER_CONTAINER="${KIND_CLUSTER_NAME}-worker"
-
-          dump_snapshotter_ready_debug() {
-            local selector
-
-            selector="app.kubernetes.io/name=nydus-snapshotter,app.kubernetes.io/instance=${HELM_RELEASE}"
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" get ds nydus-snapshotter -n "${HELM_NAMESPACE}" -o wide >&2 || true
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" get pods -n "${HELM_NAMESPACE}" -l "${selector}" -o wide >&2 || true
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" describe ds nydus-snapshotter -n "${HELM_NAMESPACE}" >&2 || true
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" get runtimeclass runc-overlayfs -o yaml >&2 || true
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" logs -n "${HELM_NAMESPACE}" -l app.kubernetes.io/name=nydus-snapshotter --all-containers >&2 || true
-            docker exec "${WORKER_CONTAINER}" sh -lc '
-              echo "--- containerd config dump ---"
-              containerd config dump 2>/dev/null || true
-              echo "--- crictl info ---"
-              crictl info || true
-              echo "--- containerd journal ---"
-              journalctl -u containerd -n 120 --no-pager || true
-            ' >&2 || true
-          }
-
-          get_expected_snapshotter_count() {
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -Ev 'control-plane|master' | wc -l | tr -d ' '
-          }
-
-          wait_for_snapshotter_pod_ready() {
-            local pod_name="$1"
-            local phase=""
-            local ready=""
-            local init_summary=""
-            local container_summary=""
-            local attempt=""
-            local pod_events=""
-
-            for attempt in $(seq 1 120); do
-              if ! kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod "${pod_name}" -n "${HELM_NAMESPACE}" >/dev/null 2>&1; then
-                echo "Snapshotter pod ${pod_name} is not visible yet (attempt ${attempt}/120)" >&2
-                sleep 2
-                continue
-              fi
-
-              phase="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod "${pod_name}" -n "${HELM_NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-              ready="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod "${pod_name}" -n "${HELM_NAMESPACE}" -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}' 2>/dev/null || true)"
-              init_summary="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod "${pod_name}" -n "${HELM_NAMESPACE}" -o jsonpath='{range .status.initContainerStatuses[*]}{.name}{" ready="}{.ready}{" waiting="}{.state.waiting.reason}{" terminated="}{.state.terminated.reason}{" exit="}{.state.terminated.exitCode}{";"}{end}' 2>/dev/null || true)"
-              container_summary="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod "${pod_name}" -n "${HELM_NAMESPACE}" -o jsonpath='{range .status.containerStatuses[*]}{.name}{" ready="}{.ready}{" restart="}{.restartCount}{" waiting="}{.state.waiting.reason}{" terminated="}{.state.terminated.reason}{" runningStarted="}{.state.running.startedAt}{";"}{end}' 2>/dev/null || true)"
-
-              echo "snapshotter pod status: attempt=${attempt}/120 name=${pod_name} phase=${phase:-Unknown} ready=${ready:-Unknown} init=[${init_summary:-none}] containers=[${container_summary:-none}]" >&2
-              kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod "${pod_name}" -n "${HELM_NAMESPACE}" -o wide --no-headers >&2 || true
-
-              if [ "${ready}" = "True" ]; then
-                return 0
-              fi
-
-              if [ $((attempt % 5)) -eq 0 ]; then
-                echo "snapshotter pod events (attempt ${attempt}/120):" >&2
-                pod_events="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" describe pod "${pod_name}" -n "${HELM_NAMESPACE}" 2>/dev/null | sed -n '/^Events:/,$p' || true)"
-                if [ -n "${pod_events}" ]; then
-                  printf '%s\n' "${pod_events}" >&2
-                  if printf '%s\n' "${pod_events}" | grep -q 'FailedCreatePodSandBox'; then
-                    echo "Snapshotter pod ${pod_name} is failing during sandbox creation; aborting wait early" >&2
-                    dump_snapshotter_ready_debug
-                    return 1
-                  fi
-                fi
-              fi
-
-              sleep 2
-            done
-
-            echo "Snapshotter pod ${pod_name} did not become Ready in time" >&2
-            dump_snapshotter_ready_debug
-            return 1
-          }
-
-          wait_for_snapshotter_ready() {
-            local selector
-            local expected=""
-            local ready_pod=""
-            local candidate_pod=""
-
-            selector="app.kubernetes.io/name=nydus-snapshotter,app.kubernetes.io/instance=${HELM_RELEASE}"
-            expected="$(get_expected_snapshotter_count)"
-
-            if [ "${expected:-0}" = "0" ]; then
-              echo "Expected snapshotter pod count resolved to zero during recovery" >&2
-              dump_snapshotter_ready_debug
-              return 1
-            fi
-
-            echo "Waiting for snapshotter desiredNumberScheduled=${expected}" >&2
-            if ! kubectl --context "kind-${KIND_CLUSTER_NAME}" wait --for=jsonpath="{.status.desiredNumberScheduled}"="${expected}" ds/nydus-snapshotter -n "${HELM_NAMESPACE}" --timeout=240s 1>&2; then
-              echo "Snapshotter DaemonSet desiredNumberScheduled did not reach ${expected}" >&2
-              dump_snapshotter_ready_debug
-              return 1
-            fi
-
-            echo "Waiting for snapshotter currentNumberScheduled=${expected}" >&2
-            if ! kubectl --context "kind-${KIND_CLUSTER_NAME}" wait --for=jsonpath="{.status.currentNumberScheduled}"="${expected}" ds/nydus-snapshotter -n "${HELM_NAMESPACE}" --timeout=240s 1>&2; then
-              echo "Snapshotter DaemonSet currentNumberScheduled did not reach ${expected}" >&2
-              dump_snapshotter_ready_debug
-              return 1
-            fi
-
-            candidate_pod="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pods -n "${HELM_NAMESPACE}" -l "${selector}" --sort-by=.metadata.creationTimestamp -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | tail -n 1)"
-            if [ -z "${candidate_pod}" ]; then
-              echo "Snapshotter DaemonSet reached expected scheduling counts but no pod was found" >&2
-              dump_snapshotter_ready_debug
-              return 1
-            fi
-
-            echo "Waiting for snapshotter pod ${candidate_pod} to become Ready" >&2
-            if ! wait_for_snapshotter_pod_ready "${candidate_pod}"; then
-              echo "Snapshotter pod ${candidate_pod} did not become Ready" >&2
-              dump_snapshotter_ready_debug
-              return 1
-            fi
-
-            ready_pod="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pods -n "${HELM_NAMESPACE}" -l "${selector}" --no-headers 2>/dev/null | awk '$2=="1/1" && $3=="Running" { print $1; exit }')"
-            if [ -z "${ready_pod}" ]; then
-              echo "Snapshotter DaemonSet recovered but no ready pod was found" >&2
-              dump_snapshotter_ready_debug
-              return 1
-            fi
-
-            printf '%s\n' "${ready_pod}"
-          }
+          source tests/helpers/helm-e2e.sh
 
           kubectl --context "kind-${KIND_CLUSTER_NAME}" patch ds nydus-snapshotter -n "${HELM_NAMESPACE}" --type=json \
             -p='[{"op":"remove","path":"/spec/template/spec/nodeSelector"}]'
 
-          RECOVERED_SNAPSHOTTER_POD="$(wait_for_snapshotter_ready)"
+          RECOVERED_SNAPSHOTTER_POD="$(helm_e2e::wait_for_snapshotter_ready)"
           echo "Snapshotter recovered with pod ${RECOVERED_SNAPSHOTTER_POD}"
           test "$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get ds nydus-snapshotter -n "${HELM_NAMESPACE}" -o jsonpath='{.status.desiredNumberScheduled}')" != "0"
-          kubectl --context "kind-${KIND_CLUSTER_NAME}" wait --for=condition=Ready -n "${WORKLOAD_NAMESPACE}" pod/"${NGINX_POD_NAME}" --timeout=180s
-          docker exec "${WORKER_CONTAINER}" sh -lc "curl -fsS -o /dev/null -I http://127.0.0.1:${NGINX_HOST_PORT}"
+          helm_e2e::assert_workload_healthy 180s
 
       - name: Load new Helm image into kind
         run: |
@@ -496,246 +240,12 @@ jobs:
       - name: Hot-upgrade nydusd and verify
         run: |
           set -euo pipefail
+          source tests/helpers/helm-e2e.sh
 
-          get_snapshotter_pod() {
-            local selector
-            local pod=""
-
-            selector="app.kubernetes.io/name=nydus-snapshotter,app.kubernetes.io/instance=${HELM_RELEASE}"
-
-            pod="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pods -n "${HELM_NAMESPACE}" -l "${selector}" --no-headers 2>/dev/null | awk '$2=="1/1" && $3=="Running" { print $1; exit }')"
-            if [ -n "${pod}" ]; then
-              printf '%s\n' "${pod}"
-              return 0
-            fi
-
-            echo "Unable to find a running nydus-snapshotter pod" >&2
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" get pods -n "${HELM_NAMESPACE}" -l "${selector}" -o wide || true
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" describe ds nydus-snapshotter -n "${HELM_NAMESPACE}" || true
-            return 1
-          }
-
-          WORKER_CONTAINER="${KIND_CLUSTER_NAME}-worker"
-
-          get_image_git_commit() {
-            local image_tag="$1"
-            docker run --rm --entrypoint /nydus-static/nydusd "${IMAGE_REPOSITORY}/${IMAGE_NAME}:${image_tag}" --version | sed -n 's/^Git Commit:[[:space:]]*//p' | head -n 1
-          }
-
-          get_live_daemon_git_commit() {
-            local daemons_json
-            local api_sock
-            local daemon_json
-
-            daemons_json="$(docker exec "${WORKER_CONTAINER}" sh -lc "curl -fsS --unix-socket /run/containerd-nydus/system.sock http://unix/api/v1/daemons")"
-            api_sock="$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(next((item.get("api_socket", "") for item in data if item.get("instances")), ""))' <<<"${daemons_json}")"
-            if [ -z "${api_sock}" ]; then
-              echo "Unable to find a live nydusd API socket" >&2
-              echo "${daemons_json}" >&2
-              return 1
-            fi
-
-            daemon_json="$(docker exec "${WORKER_CONTAINER}" sh -lc "curl -fsS --unix-socket '${api_sock}' http://unix/api/v1/daemon")"
-            python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("version", {}).get("git_commit", ""))' <<<"${daemon_json}"
-          }
-
-          dump_worker_containerd_hot_upgrade_baseline_debug() {
-            docker exec "${WORKER_CONTAINER}" sh -lc '
-              echo "--- /etc/containerd/config.toml ---"
-              sed -n "1,240p" /etc/containerd/config.toml || true
-              echo "--- /etc/containerd/nydus-proxy.toml ---"
-              sed -n "1,240p" /etc/containerd/nydus-proxy.toml || true
-              echo "--- crictl info ---"
-              crictl info || true
-              echo "--- containerd config dump ---"
-              containerd config dump 2>/dev/null || true
-              echo "--- containerd journal ---"
-              journalctl -u containerd -n 120 --no-pager || true
-            ' >&2 || true
-          }
-
-          wait_for_worker_containerd_ready() {
-            local attempt=""
-
-            for attempt in $(seq 1 60); do
-              if docker exec "${WORKER_CONTAINER}" sh -lc 'ctr --address /run/containerd/containerd.sock version >/dev/null 2>&1'; then
-                return 0
-              fi
-              sleep 2
-            done
-
-            echo "worker containerd did not become ready before hot-upgrade rollout" >&2
-            dump_worker_containerd_hot_upgrade_baseline_debug
-            return 1
-          }
-
-          restore_worker_containerd_baseline_for_hot_upgrade() {
-            local info_json=""
-            local config_toml=""
-            local default_runtime=""
-            local root_snapshotter=""
-            local import_count=""
-
-            echo "Restoring worker containerd baseline to runc/overlayfs before hot-upgrade rollout" >&2
-            docker exec "${WORKER_CONTAINER}" sh -lc '
-              set -eu
-              config_path="/etc/containerd/config.toml"
-              import_path="/etc/containerd/nydus-proxy.toml"
-
-              if grep -qF "$import_path" "$config_path"; then
-                sed -i "\|$import_path|d" "$config_path"
-              fi
-
-              rm -f /run/containerd-nydus/.containerd-restart-required
-              systemctl restart containerd
-            '
-
-            wait_for_worker_containerd_ready
-
-            info_json="$(docker exec "${WORKER_CONTAINER}" sh -lc 'crictl info -o json')"
-            config_toml="$(docker exec "${WORKER_CONTAINER}" sh -lc 'cat /etc/containerd/config.toml')"
-            default_runtime="$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("config", {}).get("containerd", {}).get("defaultRuntimeName", ""))' <<<"${info_json}")"
-            root_snapshotter="$(printf '%s\n' "${config_toml}" | sed -n 's/^[[:space:]]*snapshotter[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
-            import_count="$(printf '%s\n' "${config_toml}" | grep -cF '/etc/containerd/nydus-proxy.toml' || true)"
-
-            echo "worker containerd baseline before hot-upgrade: defaultRuntimeName=${default_runtime:-<empty>} root.snapshotter=${root_snapshotter:-<empty>} nydusImportCount=${import_count:-<empty>}" >&2
-
-            if [ "${default_runtime}" != "runc" ] || [ "${root_snapshotter}" != "overlayfs" ] || [ "${import_count}" != "0" ]; then
-              echo "worker containerd did not restore to the expected runc/overlayfs baseline before hot-upgrade rollout" >&2
-              dump_worker_containerd_hot_upgrade_baseline_debug
-              return 1
-            fi
-          }
-
-          retry_until_match() {
-            local description="$1"
-            local expected="$2"
-            local attempts="$3"
-            local interval_seconds="$4"
-            local callback="$5"
-            local observed=""
-
-            for _ in $(seq 1 "${attempts}"); do
-              observed="$("${callback}" || true)"
-              if [ "${observed}" = "${expected}" ]; then
-                printf '%s\n' "${observed}"
-                return 0
-              fi
-              sleep "${interval_seconds}"
-            done
-
-            echo "Timed out waiting for ${description} ${expected}, last observed ${observed:-<empty>}" >&2
-            return 1
-          }
-
-          wait_for_live_daemon_git_commit() {
-            retry_until_match "live nydusd git commit" "$1" 30 2 get_live_daemon_git_commit
-          }
-
-          dump_snapshotter_upgrade_debug() {
-            local selector="$1"
-            local pod_name="${2:-}"
-
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" get ds nydus-snapshotter -n "${HELM_NAMESPACE}" -o wide >&2 || true
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" get pods -n "${HELM_NAMESPACE}" -l "${selector}" -o wide >&2 || true
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" describe ds nydus-snapshotter -n "${HELM_NAMESPACE}" >&2 || true
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" get runtimeclass runc-overlayfs -o yaml >&2 || true
-            if [ -n "${pod_name}" ]; then
-              kubectl --context "kind-${KIND_CLUSTER_NAME}" describe pod "${pod_name}" -n "${HELM_NAMESPACE}" >&2 || true
-            fi
-            kubectl --context "kind-${KIND_CLUSTER_NAME}" logs -n "${HELM_NAMESPACE}" -l app.kubernetes.io/name=nydus-snapshotter --all-containers >&2 || true
-            docker exec "${WORKER_CONTAINER}" sh -lc '
-              echo "--- containerd config dump ---"
-              containerd config dump 2>/dev/null || true
-              echo "--- crictl info ---"
-              crictl info || true
-              echo "--- containerd journal ---"
-              journalctl -u containerd -n 120 --no-pager || true
-            ' >&2 || true
-          }
-
-          wait_for_upgraded_snapshotter_pod() {
-            local previous_pod="$1"
-            local selector
-            local expected=""
-            local candidate_pod=""
-            local phase=""
-            local ready=""
-            local init_summary=""
-            local container_summary=""
-            local pod_events=""
-            local attempt=""
-
-            selector="app.kubernetes.io/name=nydus-snapshotter,app.kubernetes.io/instance=${HELM_RELEASE}"
-            expected="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -Ev 'control-plane|master' | wc -l | tr -d ' ')"
-
-            if [ "${expected:-0}" = "0" ]; then
-              echo "Expected snapshotter pod count resolved to zero during hot-upgrade" >&2
-              dump_snapshotter_upgrade_debug "${selector}"
-              return 1
-            fi
-
-            echo "Waiting for upgraded snapshotter desiredNumberScheduled=${expected}" >&2
-            if ! kubectl --context "kind-${KIND_CLUSTER_NAME}" wait --for=jsonpath="{.status.desiredNumberScheduled}"="${expected}" ds/nydus-snapshotter -n "${HELM_NAMESPACE}" --timeout=240s 1>&2; then
-              echo "Snapshotter DaemonSet desiredNumberScheduled did not reach ${expected} during hot-upgrade" >&2
-              dump_snapshotter_upgrade_debug "${selector}"
-              return 1
-            fi
-
-            echo "Waiting for upgraded snapshotter currentNumberScheduled=${expected}" >&2
-            if ! kubectl --context "kind-${KIND_CLUSTER_NAME}" wait --for=jsonpath="{.status.currentNumberScheduled}"="${expected}" ds/nydus-snapshotter -n "${HELM_NAMESPACE}" --timeout=240s 1>&2; then
-              echo "Snapshotter DaemonSet currentNumberScheduled did not reach ${expected} during hot-upgrade" >&2
-              dump_snapshotter_upgrade_debug "${selector}"
-              return 1
-            fi
-
-            for attempt in $(seq 1 120); do
-              candidate_pod="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pods -n "${HELM_NAMESPACE}" -l "${selector}" --sort-by=.metadata.creationTimestamp -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | tail -n 1)"
-              if [ -z "${candidate_pod}" ]; then
-                echo "No snapshotter pod is visible yet during hot-upgrade (attempt ${attempt}/120)" >&2
-                sleep 2
-                continue
-              fi
-
-              phase="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod "${candidate_pod}" -n "${HELM_NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-              ready="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod "${candidate_pod}" -n "${HELM_NAMESPACE}" -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}' 2>/dev/null || true)"
-              init_summary="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod "${candidate_pod}" -n "${HELM_NAMESPACE}" -o jsonpath='{range .status.initContainerStatuses[*]}{.name}{" ready="}{.ready}{" waiting="}{.state.waiting.reason}{" terminated="}{.state.terminated.reason}{" exit="}{.state.terminated.exitCode}{";"}{end}' 2>/dev/null || true)"
-              container_summary="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod "${candidate_pod}" -n "${HELM_NAMESPACE}" -o jsonpath='{range .status.containerStatuses[*]}{.name}{" ready="}{.ready}{" restart="}{.restartCount}{" waiting="}{.state.waiting.reason}{" terminated="}{.state.terminated.reason}{" runningStarted="}{.state.running.startedAt}{";"}{end}' 2>/dev/null || true)"
-
-              echo "hot-upgrade snapshotter pod status: attempt=${attempt}/120 previous=${previous_pod} candidate=${candidate_pod} phase=${phase:-Unknown} ready=${ready:-Unknown} init=[${init_summary:-none}] containers=[${container_summary:-none}]" >&2
-              kubectl --context "kind-${KIND_CLUSTER_NAME}" get pods -n "${HELM_NAMESPACE}" -l "${selector}" -o wide >&2 || true
-
-              if [ "${candidate_pod}" != "${previous_pod}" ] && [ "${ready}" = "True" ]; then
-                printf '%s\n' "${candidate_pod}"
-                return 0
-              fi
-
-              if [ $((attempt % 5)) -eq 0 ]; then
-                echo "hot-upgrade snapshotter pod events (attempt ${attempt}/120):" >&2
-                pod_events="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" describe pod "${candidate_pod}" -n "${HELM_NAMESPACE}" 2>/dev/null | sed -n '/^Events:/,$p' || true)"
-                if [ -n "${pod_events}" ]; then
-                  printf '%s\n' "${pod_events}" >&2
-                  if printf '%s\n' "${pod_events}" | grep -q 'FailedCreatePodSandBox'; then
-                    echo "Snapshotter pod ${candidate_pod} is failing during sandbox creation in hot-upgrade; aborting wait early" >&2
-                    dump_snapshotter_upgrade_debug "${selector}" "${candidate_pod}"
-                    return 1
-                  fi
-                fi
-              fi
-
-              sleep 2
-            done
-
-            echo "Timed out waiting for upgraded snapshotter pod to replace ${previous_pod}" >&2
-            dump_snapshotter_upgrade_debug "${selector}" "${candidate_pod}"
-            return 1
-          }
-
-          kubectl --context "kind-${KIND_CLUSTER_NAME}" rollout status ds/nydus-snapshotter -n "${HELM_NAMESPACE}" --timeout=240s
-          PRE_UPGRADE_POD="$(get_snapshotter_pod)"
+          PRE_UPGRADE_POD="$(helm_e2e::get_snapshotter_pod)"
           PRE_NGINX_RESTARTS="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod -n "${WORKLOAD_NAMESPACE}" "${NGINX_POD_NAME}" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
-          OLD_IMAGE_COMMIT="$(get_image_git_commit old)"
-          NEW_IMAGE_COMMIT="$(get_image_git_commit new)"
+          OLD_IMAGE_COMMIT="$(helm_e2e::get_image_git_commit old)"
+          NEW_IMAGE_COMMIT="$(helm_e2e::get_image_git_commit new)"
 
           if [ -z "${OLD_IMAGE_COMMIT}" ] || [ -z "${NEW_IMAGE_COMMIT}" ]; then
             echo "Failed to resolve git commits from Helm images" >&2
@@ -745,10 +255,9 @@ jobs:
             echo "Old and new Helm images resolved to the same nydusd git commit" >&2
             exit 1
           fi
-          PRE_LIVE_COMMIT="$(wait_for_live_daemon_git_commit "${OLD_IMAGE_COMMIT}")"
-          restore_worker_containerd_baseline_for_hot_upgrade
-          kubectl --context "kind-${KIND_CLUSTER_NAME}" wait --for=condition=Ready -n "${WORKLOAD_NAMESPACE}" pod/"${NGINX_POD_NAME}" --timeout=180s
-          docker exec "${WORKER_CONTAINER}" sh -lc "curl -fsS -o /dev/null -I http://127.0.0.1:${NGINX_HOST_PORT}"
+          PRE_LIVE_COMMIT="$(helm_e2e::wait_for_live_daemon_git_commit "${OLD_IMAGE_COMMIT}")"
+          helm_e2e::restore_worker_containerd_baseline "hot-upgrade rollout"
+          helm_e2e::assert_workload_healthy 180s
 
           helm --kube-context "kind-${KIND_CLUSTER_NAME}" upgrade "${HELM_RELEASE}" charts/ \
             --namespace "${HELM_NAMESPACE}" \
@@ -760,29 +269,28 @@ jobs:
             --timeout 5m
 
           CONFIG_CONTENT="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get configmap -n "${HELM_NAMESPACE}" nydus-snapshotter-config -o go-template='{{index .data "config.toml"}}')"
-          NEW_POD="$(wait_for_upgraded_snapshotter_pod "${PRE_UPGRADE_POD}")"
+          NEW_POD="$(helm_e2e::wait_for_upgraded_snapshotter_pod "${PRE_UPGRADE_POD}")"
           POST_NGINX_RESTARTS="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod -n "${WORKLOAD_NAMESPACE}" "${NGINX_POD_NAME}" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
           CONTAINER_REF="$(kubectl --context "kind-${KIND_CLUSTER_NAME}" get pod -n "${WORKLOAD_NAMESPACE}" "${NGINX_POD_NAME}" -o jsonpath='{.status.containerStatuses[0].containerID}')"
           CONTAINER_ID="${CONTAINER_REF#containerd://}"
-          SNAPSHOTTER_NAME="$(docker exec "${WORKER_CONTAINER}" sh -lc "crictl inspect ${CONTAINER_ID} | sed -n 's/.*\\\"snapshotter\\\": \\\"\\([^\\\"]*\\)\\\".*/\\1/p' | head -n 1")"
-          POST_LIVE_COMMIT="$(wait_for_live_daemon_git_commit "${NEW_IMAGE_COMMIT}")"
+          SNAPSHOTTER_NAME="$(docker exec "$(helm_e2e::worker_container)" sh -lc "crictl inspect ${CONTAINER_ID} | sed -n 's/.*\\\"snapshotter\\\": \\\"\\([^\\\"]*\\)\\\".*/\\1/p' | head -n 1")"
+          POST_LIVE_COMMIT="$(helm_e2e::wait_for_live_daemon_git_commit "${NEW_IMAGE_COMMIT}")"
 
           grep -F 'nydusd_path = "/opt/nydus/bin/nydusd"' <<<"${CONFIG_CONTENT}"
           if [ "${NEW_POD}" = "${PRE_UPGRADE_POD}" ]; then
             echo "Snapshotter pod did not roll during Helm upgrade" >&2
             exit 1
           fi
-          kubectl --context "kind-${KIND_CLUSTER_NAME}" wait --for=condition=Ready -n "${WORKLOAD_NAMESPACE}" pod/"${NGINX_POD_NAME}" --timeout=180s
+          helm_e2e::assert_workload_healthy 180s
           test "${POST_NGINX_RESTARTS}" = "${PRE_NGINX_RESTARTS}"
           test "${SNAPSHOTTER_NAME}" = "nydus"
           test "${PRE_LIVE_COMMIT}" = "${OLD_IMAGE_COMMIT}"
           test "${POST_LIVE_COMMIT}" = "${NEW_IMAGE_COMMIT}"
 
-          docker exec "${WORKER_CONTAINER}" sh -lc "curl -fsS -o /dev/null -I http://127.0.0.1:${NGINX_HOST_PORT}"
-          docker exec "${WORKER_CONTAINER}" sh -lc "ps -ef | grep '/opt/nydus/bin/nydusd' | grep -v grep"
-          docker exec "${WORKER_CONTAINER}" sh -lc "grep -F 'nydusd command: /opt/nydus/bin/nydusd fuse --upgrade' /var/lib/containerd/io.containerd.snapshotter.v1.nydus/logs/nydus-snapshotter.log"
+          docker exec "$(helm_e2e::worker_container)" sh -lc "ps -ef | grep '/opt/nydus/bin/nydusd' | grep -v grep"
+          docker exec "$(helm_e2e::worker_container)" sh -lc "grep -F 'nydusd command: /opt/nydus/bin/nydusd fuse --upgrade' /var/lib/containerd/io.containerd.snapshotter.v1.nydus/logs/nydus-snapshotter.log"
 
-          if docker exec "${WORKER_CONTAINER}" sh -lc "grep -F 'hot upgrade failed' /var/lib/containerd/io.containerd.snapshotter.v1.nydus/logs/nydus-snapshotter.log"; then
+          if docker exec "$(helm_e2e::worker_container)" sh -lc "grep -F 'hot upgrade failed' /var/lib/containerd/io.containerd.snapshotter.v1.nydus/logs/nydus-snapshotter.log"; then
             echo "Detected hot upgrade failure in snapshotter logs" >&2
             exit 1
           fi
